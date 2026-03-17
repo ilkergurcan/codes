@@ -1,0 +1,1988 @@
+# %% [markdown]
+
+# # Causal ML Pipeline for Time Deposit Renewal Rate Optimization (v2)
+
+# 
+
+# **Goal**: Estimate how customers causally respond to different interest rates at renewal,
+
+# segment them into actionable groups (Sure Thing / Sleeping Dog / Persuadable),
+
+# find optimal rates per segment, run post-causal optimization, and validate everything.
+
+# 
+
+# —
+
+# 
+
+# ## Required Input DataFrames
+
+# 
+
+# **df1 — Customer Demographics & Account Info (one row per customer)**
+
+# | Column              | Type     | Description                                        |
+
+# |———————|–––––|––––––––––––––––––––––––––|
+
+# | customer_id         | str/int  | Unique customer identifier                         |
+
+# | age                 | int      | Customer age                                       |
+
+# | gender              | str      | M/F/Other                                          |
+
+# | income_bucket       | str/int  | Income segment (e.g., 1-5 or categorical)          |
+
+# | tenure_months       | int      | Months as bank customer                            |
+
+# | credit_score        | float    | Internal credit score                              |
+
+# | total_products      | int      | Number of bank products held                       |
+
+# | has_mortgage        | bool/int | Whether customer has a mortgage                    |
+
+# | has_credit_card     | bool/int | Whether customer has a credit card                 |
+
+# | has_savings_account | bool/int | Whether customer has a savings account              |
+
+# | customer_risk_tier  | str/int  | Internal risk classification                       |
+
+# 
+
+# **df2 — Renewal Events (one row per renewal event — ALL instances, including intermediate ones)**
+
+# | Column              | Type     | Description                                        |
+
+# |———————|–––––|––––––––––––––––––––––––––|
+
+# | customer_id         | str/int  | Links to df1                                       |
+
+# | renewal_date        | datetime | When the renewal decision happened                 |
+
+# | branch_code         | str/int  | Branch where renewal happened (KEY: bargaining!)   |
+
+# | project_code        | str/int  | Product/project code                               |
+
+# | balance             | float    | Deposit balance at renewal time                    |
+
+# | account_opening_code| str/int  | How the account was opened                         |
+
+# | customer_type       | str/int  | Customer classification                            |
+
+# | maturity_duration   | int/str  | Term / maturity of the deposit (months or category)|
+
+# | offered_rate        | float    | Rate offered at renewal (TREATMENT) e.g. 0.045     |
+
+# | renewed             | int      | 1 = renewed, 0 = churned (OUTCOME)                 |
+
+# | previous_rate       | float    | Rate on the expiring deposit                       |
+
+# 
+
+# **df3 — Behavioral / Transaction Features (one row per customer)**
+
+# | Column                    | Type   | Description                                  |
+
+# |—————————|––––|–––––––––––––––––––––––|
+
+# | customer_id               | str/int| Links to df1                                 |
+
+# | avg_monthly_transactions  | float  | Average monthly transaction count            |
+
+# | digital_engagement_score  | float  | App/online banking usage score               |
+
+# | num_service_calls_last_6m | int    | Customer service interactions                |
+
+# | num_complaints_last_12m   | int    | Complaints filed                             |
+
+# | avg_monthly_balance_other | float  | Average balance in OTHER accounts            |
+
+# | recent_balance_trend      | float  | Trend in overall balances (positive=growing) |
+
+# | days_since_last_login     | int    | Digital engagement recency                   |
+
+# | num_products_added_last_12m| int   | Recent cross-sell activity                   |
+
+# 
+
+# **NOTE**: df3 is optional. If you don’t have separate behavioral data, the pipeline
+
+# will still work — renewal history features engineered from df2 will serve as behavioral proxies.
+
+# %% [markdown]
+
+# ## Cell 0: Install Dependencies
+
+# %%
+
+# !pip install econml dowhy scikit-learn lightgbm shap matplotlib seaborn pandas numpy scipy
+
+# %% [markdown]
+
+# ## Cell 1: Imports
+
+# %%
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings(‘ignore’)
+
+# Sklearn
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import lightgbm as lgb
+
+# Causal ML
+
+from econml.dml import CausalForestDML, LinearDML
+from econml.policy import PolicyTree
+
+# DoWhy for identification and refutation
+
+from dowhy import CausalModel
+
+# Scipy for optimization
+
+from scipy.optimize import minimize_scalar
+from scipy.stats import norm
+
+print(“All imports successful.”)
+
+# %% [markdown]
+
+# ## Cell 2: Load Data and Engineer Renewal History Features
+
+# 
+
+# **CRITICAL DESIGN DECISION**: We use ONLY the last renewal instance per customer
+
+# as the outcome observation. Why?
+
+# 
+
+# Intermediate renewal instances (renewed=1 by construction) create survivorship bias.
+
+# You only see instance 3 BECAUSE the customer renewed at instances 1 and 2.
+
+# This inflates the renewal rate and biases treatment effects toward zero.
+
+# 
+
+# But we DON’T throw away the history — we extract it as features.
+
+# %%
+
+# =============================================================================
+
+# LOAD YOUR DATA HERE
+
+# =============================================================================
+
+# df1 = pd.read_csv(“customer_demographics.csv”)
+
+# df2 = pd.read_csv(“renewal_events.csv”)      # ALL instances, including intermediate ones
+
+# df3 = pd.read_csv(“behavioral_features.csv”)  # Optional
+
+# Ensure types
+
+df2[“renewal_date”] = pd.to_datetime(df2[“renewal_date”])
+
+# =============================================================================
+
+# RATE NORMALIZATION — convert to decimal form BEFORE any feature engineering
+
+# If offered_rate is in whole-percentage form (e.g., 38.50 meaning 38.50%),
+
+# convert to decimal (0.3850). Detection: if mean > 1, it’s not decimal.
+
+# This MUST happen before history engineering so all derived features are consistent.
+
+# =============================================================================
+
+for rate_col in [“offered_rate”, “previous_rate”]:
+if rate_col in df2.columns and df2[rate_col].mean() > 1:
+print(f”  ⚠️  {rate_col} in whole-% form (mean={df2[rate_col].mean():.2f})”)
+print(f”      Converting to decimal: {df2[rate_col].mean():.2f} → {df2[rate_col].mean()/100:.4f}”)
+df2[rate_col] = df2[rate_col] / 100
+
+print(f”Rate scale after normalization:”)
+print(f”  offered_rate:  [{df2[‘offered_rate’].min():.4f}, {df2[‘offered_rate’].max():.4f}], “
+f”mean={df2[‘offered_rate’].mean():.4f}”)
+if “previous_rate” in df2.columns:
+print(f”  previous_rate: [{df2[‘previous_rate’].min():.4f}, {df2[‘previous_rate’].max():.4f}], “
+f”mean={df2[‘previous_rate’].mean():.4f}”)
+
+# =============================================================================
+
+# STEP A: Engineer features from the FULL renewal history
+
+# These capture the customer’s historical relationship with rate changes.
+
+# =============================================================================
+
+df2_sorted = df2.sort_values([“customer_id”, “renewal_date”])
+
+renewal_history = df2_sorted.groupby(“customer_id”).agg(
+# — Renewal track record —
+# How many prior renewals? More renewals = more loyal customer historically.
+num_prior_renewals=(“renewed”, “count”),
+
+```
+# --- Rate trajectory ---
+# Was the bank gradually lowering their rate? Customers may tolerate slow declines
+# but snap at sudden drops. These features capture that trajectory.
+avg_historical_rate=("offered_rate", "mean"),
+min_historical_rate=("offered_rate", "min"),
+max_historical_rate=("offered_rate", "max"),
+std_historical_rate=("offered_rate", "std"),
+
+# --- Balance trajectory ---
+# Is this customer growing or shrinking their deposit over time?
+avg_historical_balance=("balance", "mean"),
+first_balance=("balance", "first"),
+
+# --- Maturity patterns ---
+# Has the customer always chosen the same term, or do they shift?
+first_renewal_date=("renewal_date", "min"),
+
+# --- Previous rate (for computing rate change) ---
+last_previous_rate=("previous_rate", "last"),
+```
+
+).reset_index()
+
+# Compute rate trend: slope of offered rates over time
+
+# A declining trend means the bank has been cutting this customer’s rate repeatedly
+
+def compute_rate_trend(group):
+if len(group) <= 1:
+return 0.0
+rates = group[“offered_rate”].values
+# Simple: last rate minus first rate divided by number of renewals
+return (rates[-1] - rates[0]) / (len(rates) - 1)
+
+rate_trends = (
+df2_sorted.groupby(“customer_id”)
+.apply(compute_rate_trend)
+.reset_index(name=“rate_trend_per_renewal”)
+)
+renewal_history = renewal_history.merge(rate_trends, on=“customer_id”, how=“left”)
+
+# Compute balance trend similarly
+
+def compute_balance_trend(group):
+if len(group) <= 1:
+return 0.0
+balances = group[“balance”].values
+return (balances[-1] - balances[0]) / (len(balances) - 1)
+
+balance_trends = (
+df2_sorted.groupby(“customer_id”)
+.apply(compute_balance_trend)
+.reset_index(name=“balance_trend_per_renewal”)
+)
+renewal_history = renewal_history.merge(balance_trends, on=“customer_id”, how=“left”)
+
+# Fill NaN for single-instance customers (no history to compute from)
+
+renewal_history[“std_historical_rate”] = renewal_history[“std_historical_rate”].fillna(0)
+renewal_history[“rate_trend_per_renewal”] = renewal_history[“rate_trend_per_renewal”].fillna(0)
+renewal_history[“balance_trend_per_renewal”] = renewal_history[“balance_trend_per_renewal”].fillna(0)
+
+# Subtract 1 from count because the last instance is the outcome, not part of “prior” history
+
+renewal_history[“num_prior_renewals”] = (renewal_history[“num_prior_renewals”] - 1).clip(lower=0)
+
+print(f”Renewal history engineered for {len(renewal_history)} customers”)
+print(f”Customers with 0 prior renewals (first-timers): “
+f”{(renewal_history[‘num_prior_renewals’] == 0).sum()}”)
+print(f”Customers with 3+ prior renewals: “
+f”{(renewal_history[‘num_prior_renewals’] >= 3).sum()}”)
+
+# =============================================================================
+
+# STEP B: Keep ONLY the last instance per customer (the genuine decision point)
+
+# =============================================================================
+
+df2_last = (
+df2_sorted
+.groupby(“customer_id”)
+.tail(1)  # Last row per customer (sorted by date)
+.copy()
+)
+
+print(f”\nFull dataset: {len(df2)} renewal events”)
+print(f”After keeping last instance only: {len(df2_last)} events”)
+print(f”Renewal rate (full, biased):      {df2[‘renewed’].mean():.3f}”)
+print(f”Renewal rate (last instance):     {df2_last[‘renewed’].mean():.3f}”)
+print(f”  ↑ This should be lower — that’s the survivorship bias we’re removing.”)
+
+# =============================================================================
+
+# STEP C: Merge everything into a single analysis dataframe
+
+# =============================================================================
+
+df = (
+df2_last
+.merge(df1, on=“customer_id”, how=“left”)
+.merge(renewal_history, on=“customer_id”, how=“left”)
+)
+
+# Merge df3 if you have it (behavioral features)
+
+# If df3 doesn’t exist or is empty, the pipeline still works without it
+
+try:
+if df3 is not None and len(df3) > 0:
+df = df.merge(df3, on=“customer_id”, how=“left”)
+print(f”Behavioral features (df3) merged.”)
+except NameError:
+print(“No df3 provided — pipeline will use renewal history features as behavioral proxies.”)
+
+print(f”\nFinal merged dataset: {df.shape[0]} customers, {df.shape[1]} columns”)
+print(f”Unique customers: {df[‘customer_id’].nunique()}”)
+print(f”Renewal rate: {df[‘renewed’].mean():.3f}”)
+
+# %% [markdown]
+
+# ## Cell 3: Feature Engineering & Time Proxies
+
+# 
+
+# Since you can’t access market conditions data, we use time-based features as proxies.
+
+# Year-month dummies absorb common temporal shocks: central bank rate changes,
+
+# competitive environment shifts, macro conditions. Not a perfect substitute,
+
+# but it’s the standard workaround in applied causal inference when market-level
+
+# confounders are unavailable.
+
+# %%
+
+# — TIME PROXIES FOR MISSING MARKET DATA —
+
+df[“year_month”] = df[“renewal_date”].dt.to_period(“M”).astype(str)
+df[“year”] = df[“renewal_date”].dt.year
+df[“quarter”] = df[“renewal_date”].dt.quarter
+
+# Period-average rate as a crude market environment proxy.
+
+# If the average offered rate in a given month is high, market rates are probably high.
+
+# This captures “what was the general rate environment when this renewal happened?”
+
+period_avg_rate = df.groupby(“year_month”)[“offered_rate”].transform(“mean”)
+df[“rate_spread_vs_period”] = df[“offered_rate”] - period_avg_rate
+
+# — DERIVED FEATURES FROM RATE-SETTING VARIABLES —
+
+# Rate change: how much did the bank move the rate relative to the previous deposit?
+
+df[“rate_change”] = df[“offered_rate”] - df[“previous_rate”]
+df[“rate_change_pct”] = df[“rate_change”] / df[“previous_rate”].clip(lower=0.0001)
+
+# Log balance for scale normalization
+
+df[“log_balance”] = np.log1p(df[“balance”])
+
+# Deposit tenure (how long this customer has had deposits, from first renewal to now)
+
+df[“deposit_tenure_days”] = (df[“renewal_date”] - df[“first_renewal_date”]).dt.days
+df[“deposit_tenure_days”] = df[“deposit_tenure_days”].fillna(0)
+
+# — ENCODE CATEGORICALS —
+
+# These are your actual rate-setting features — they MUST be in the confounder set.
+
+categorical_cols = [“branch_code”, “project_code”, “account_opening_code”, “customer_type”]
+
+# Also encode df1 categoricals if present
+
+for col in [“gender”, “income_bucket”, “customer_risk_tier”]:
+if col in df.columns and df[col].dtype == “object”:
+categorical_cols.append(col)
+
+for col in categorical_cols:
+if col not in df.columns:
+continue
+if df[col].dtype == “object” or df[col].dtype.name == “category”:
+df[col] = LabelEncoder().fit_transform(df[col].astype(str).fillna(“unknown”))
+
+# — BRANCH-LEVEL AGGREGATES —
+
+# branch_code is critical because customers bargain at branches.
+
+# Different branches have different bargaining cultures and rate authority.
+
+# If branch_code has high cardinality, we compress it into branch-level statistics
+
+# that capture the branch’s rate-setting behavior.
+
+branch_cardinality = df[“branch_code”].nunique()
+print(f”Branch cardinality: {branch_cardinality}”)
+
+if branch_cardinality > 50:
+# Too many branches for direct encoding — create branch-level features
+branch_stats = df.groupby(“branch_code”).agg(
+branch_avg_rate=(“offered_rate”, “mean”),       # Branch’s average pricing generosity
+branch_renewal_rate=(“renewed”, “mean”),         # Branch’s retention success
+branch_customer_count=(“customer_id”, “nunique”),# Branch size
+branch_rate_std=(“offered_rate”, “std”),         # Rate dispersion (bargaining proxy!)
+).reset_index()
+# High rate_std at a branch = lots of bargaining = lots of selection bias
+branch_stats[“branch_rate_std”] = branch_stats[“branch_rate_std”].fillna(0)
+df = df.merge(branch_stats, on=“branch_code”, how=“left”)
+BRANCH_FEATURES = [“branch_avg_rate”, “branch_renewal_rate”,
+“branch_customer_count”, “branch_rate_std”]
+print(f”  → Compressed into {len(BRANCH_FEATURES)} branch-level features”)
+else:
+# Low cardinality — keep as-is (already label-encoded)
+BRANCH_FEATURES = [“branch_code”]
+print(f”  → Using branch_code directly (low cardinality)”)
+
+# — ONE-HOT ENCODE TIME FIXED EFFECTS —
+
+# These absorb market-level temporal variation we can’t measure directly.
+
+# Without these, any rate change that coincides with a market shift gets wrong attribution.
+
+time_dummies = pd.get_dummies(df[“year_month”], prefix=“ym”, drop_first=True)
+df = pd.concat([df, time_dummies], axis=1)
+TIME_FE_COLS = [c for c in df.columns if c.startswith(“ym_”)]
+
+print(f”Time periods captured: {df[‘year_month’].nunique()} months”)
+print(f”Rate change stats:\n{df[‘rate_change’].describe()}”)
+
+# %% [markdown]
+
+# ## Cell 4: Define Variable Roles
+
+# 
+
+# This is where you explicitly declare what plays what role in the causal model.
+
+# **Getting this wrong invalidates everything downstream.**
+
+# 
+
+# The logic:
+
+# - **Confounders (W)**: Features that affect BOTH the offered rate AND the renewal decision.
+
+# These MUST be controlled for, otherwise you get selection bias.
+
+# - **Effect Modifiers (X)**: Features that determine HOW MUCH a customer’s renewal
+
+# probability changes in response to rate changes. These create heterogeneous treatment effects.
+
+# %%
+
+# === TREATMENT (continuous) ===
+
+TREATMENT_COL = “offered_rate”
+
+# === OUTCOME (binary) ===
+
+OUTCOME_COL = “renewed”
+
+# =============================================================================
+
+# CONFOUNDERS (W) — Features that cause BOTH the rate AND the renewal decision
+
+# =============================================================================
+
+# These fall into four groups:
+
+# GROUP 1: Rate-setting mechanism variables
+
+# These are your actual inputs to the pricing process.
+
+# branch_code matters because of bargaining.
+
+# project_code and account_opening_code affect the rate schedule.
+
+# customer_type and maturity_duration directly determine the base rate.
+
+RATE_SETTING_FEATURES = [
+“project_code”,
+“account_opening_code”,
+“customer_type”,
+“maturity_duration”,
+“log_balance”,            # Larger deposits get better rates AND are stickier
+“previous_rate”,          # Anchors the renewal rate AND predicts renewal
+] + BRANCH_FEATURES
+
+# GROUP 2: Customer profile features (from df1)
+
+# These determine both the customer’s negotiating position and their outside options.
+
+CUSTOMER_PROFILE_FEATURES = [
+“age”,
+“gender”,
+“income_bucket”,
+“tenure_months”,
+“credit_score”,
+“total_products”,
+“has_mortgage”,
+“has_credit_card”,
+“has_savings_account”,
+“customer_risk_tier”,
+]
+
+# GROUP 3: Renewal history features (engineered from df2)
+
+# These capture the customer’s history of renewals, rate changes, and balance trends.
+
+# num_prior_renewals is important: loyal customers get different rates AND behave differently.
+
+HISTORY_FEATURES = [
+“num_prior_renewals”,
+“avg_historical_rate”,
+“std_historical_rate”,
+“rate_trend_per_renewal”,
+“avg_historical_balance”,
+“balance_trend_per_renewal”,
+“deposit_tenure_days”,
+]
+
+# GROUP 4: Behavioral features (from df3, if available)
+
+BEHAVIORAL_FEATURES = [
+“avg_monthly_transactions”,
+“digital_engagement_score”,
+“num_service_calls_last_6m”,
+“num_complaints_last_12m”,
+“avg_monthly_balance_other”,
+“recent_balance_trend”,
+“days_since_last_login”,
+“num_products_added_last_12m”,
+]
+
+# GROUP 5: Derived features
+
+DERIVED_FEATURES = [
+“rate_change”,            # How much rate moved from previous — direct bargaining signal
+“rate_change_pct”,
+“rate_spread_vs_period”,  # Rate vs period average — proxy for “how generous” the offer is
+]
+
+# Combine all confounders + time fixed effects
+
+CONFOUNDER_COLS = (
+RATE_SETTING_FEATURES +
+CUSTOMER_PROFILE_FEATURES +
+HISTORY_FEATURES +
+BEHAVIORAL_FEATURES +
+DERIVED_FEATURES +
+TIME_FE_COLS
+)
+
+# Filter to only columns that actually exist in the dataframe
+
+CONFOUNDER_COLS = [c for c in CONFOUNDER_COLS if c in df.columns]
+
+# =============================================================================
+
+# EFFECT MODIFIERS (X) — Features that modify HOW MUCH the rate affects renewal
+
+# =============================================================================
+
+# Not every confounder modifies the treatment effect. These are the features we believe
+
+# create heterogeneous responses to rate changes.
+
+# For example: a retiree on a fixed income is more rate-sensitive than a high-income
+
+# professional with diversified investments.
+
+EFFECT_MODIFIER_COLS = [
+“age”,
+“income_bucket”,
+“tenure_months”,
+“credit_score”,
+“log_balance”,
+“maturity_duration”,
+“previous_rate”,
+“num_prior_renewals”,
+“rate_trend_per_renewal”,
+“total_products”,
+“deposit_tenure_days”,
+“customer_type”,
+]
+
+# Add behavioral features as effect modifiers if they exist
+
+for col in [“digital_engagement_score”, “avg_monthly_balance_other”, “recent_balance_trend”]:
+if col in df.columns:
+EFFECT_MODIFIER_COLS.append(col)
+
+EFFECT_MODIFIER_COLS = [c for c in EFFECT_MODIFIER_COLS if c in df.columns]
+
+print(f”Confounders (W): {len(CONFOUNDER_COLS)} features”)
+print(f”  Rate-setting:     {len([c for c in RATE_SETTING_FEATURES if c in df.columns])}”)
+print(f”  Customer profile: {len([c for c in CUSTOMER_PROFILE_FEATURES if c in df.columns])}”)
+print(f”  History:          {len([c for c in HISTORY_FEATURES if c in df.columns])}”)
+print(f”  Behavioral:       {len([c for c in BEHAVIORAL_FEATURES if c in df.columns])}”)
+print(f”  Derived:          {len([c for c in DERIVED_FEATURES if c in df.columns])}”)
+print(f”  Time FEs:         {len(TIME_FE_COLS)}”)
+print(f”Effect modifiers (X): {len(EFFECT_MODIFIER_COLS)} features”)
+
+# %% [markdown]
+
+# ## Cell 5: Prepare Analysis Matrices
+
+# 
+
+# IMPORTANT: We must encode ALL string/object/category columns to numeric BEFORE
+
+# creating the numpy matrices. This is a two-pass approach:
+
+# Pass 1 — Encode any remaining non-numeric columns
+
+# Pass 2 — Fill NaN values (everything is numeric at this point, so median works)
+
+# %%
+
+df_analysis = df.dropna(subset=[TREATMENT_COL, OUTCOME_COL]).copy()
+
+all_model_cols = list(set(CONFOUNDER_COLS + EFFECT_MODIFIER_COLS))
+
+# === PASS 1: Encode all non-numeric columns FIRST ===
+
+for col in all_model_cols:
+if col not in df_analysis.columns:
+continue
+
+```
+if df_analysis[col].dtype == "object" or df_analysis[col].dtype.name == "category":
+    n_unique = df_analysis[col].nunique()
+    
+    if n_unique <= 20:
+        # Low cardinality → Label Encode (safe for tree-based models)
+        df_analysis[col] = LabelEncoder().fit_transform(
+            df_analysis[col].astype(str).fillna("unknown")
+        )
+        print(f"  Label-encoded: {col} ({n_unique} categories)")
+    else:
+        # High cardinality → Target encode (mean of outcome per category)
+        means = df_analysis.groupby(col)[OUTCOME_COL].mean()
+        df_analysis[col] = df_analysis[col].map(means).fillna(df_analysis[OUTCOME_COL].mean())
+        print(f"  Target-encoded: {col} ({n_unique} categories)")
+
+elif df_analysis[col].dtype == "bool":
+    df_analysis[col] = df_analysis[col].astype(int)
+```
+
+# === PASS 2: Fill missing values (everything is numeric now, so median is safe) ===
+
+for col in all_model_cols:
+if col in df_analysis.columns and df_analysis[col].isna().any():
+df_analysis[col] = df_analysis[col].fillna(df_analysis[col].median())
+
+# === PASS 3: Convert to float arrays (guaranteed safe now) ===
+
+Y = df_analysis[OUTCOME_COL].values.astype(float)
+T = df_analysis[TREATMENT_COL].values.astype(float)
+W = df_analysis[CONFOUNDER_COLS].values.astype(float)
+X = df_analysis[EFFECT_MODIFIER_COLS].values.astype(float)
+
+# Sanity checks
+
+assert not np.isnan(W).any(), “NaN still present in W — check encoding”
+assert not np.isnan(X).any(), “NaN still present in X — check encoding”
+
+print(f”\nAnalysis sample: {len(Y)} observations”)
+print(f”Y (renewed) distribution: 0={int((Y==0).sum())} ({(Y==0).mean()*100:.1f}%), “
+f”1={int((Y==1).sum())} ({(Y==1).mean()*100:.1f}%)”)
+print(f”T (offered_rate) range: [{T.min():.4f}, {T.max():.4f}], “
+f”mean={T.mean():.4f}, std={T.std():.4f}”)
+print(f”W shape: {W.shape}, X shape: {X.shape}”)
+
+if T.std() < 0.001:
+print(”\n⚠️  WARNING: Very low rate variation. Causal identification will be weak.”)
+print(”   You may need more data or a different treatment definition (e.g., rate_change).”)
+
+# %% [markdown]
+
+# ## Cell 6: STEP 1 (BBVA) — Feature Selection / Dimensionality Reduction
+
+# 
+
+# Select the confounders that matter most. We use a dual-importance criterion:
+
+# a feature must predict the TREATMENT (rate) and/or the OUTCOME (renewal)
+
+# to be a useful confounder. Features that predict neither are noise.
+
+# %%
+
+print(”=== Feature Selection for Confounders ===\n”)
+
+# Train LightGBM to predict TREATMENT from confounders
+
+# Features important here are the ones that drive the rate-setting process
+
+lgb_treatment = lgb.LGBMRegressor(
+n_estimators=200, max_depth=5, learning_rate=0.05, random_state=42, verbose=-1
+)
+lgb_treatment.fit(W, T)
+treatment_imp = pd.Series(lgb_treatment.feature_importances_, index=CONFOUNDER_COLS)
+
+# Train LightGBM to predict OUTCOME from confounders
+
+# Features important here are the ones that predict renewal beyond the rate
+
+lgb_outcome = lgb.LGBMClassifier(
+n_estimators=200, max_depth=5, learning_rate=0.05, random_state=42, verbose=-1
+)
+lgb_outcome.fit(W, Y)
+outcome_imp = pd.Series(lgb_outcome.feature_importances_, index=CONFOUNDER_COLS)
+
+# Combined ranking: sum of ranks (lower = more important for either/both)
+
+combined_rank = treatment_imp.rank(ascending=False) + outcome_imp.rank(ascending=False)
+combined_rank = combined_rank.sort_values()
+
+# Keep top N features + ALL time fixed effects (non-negotiable market proxy)
+
+N_TOP = min(25, len([c for c in CONFOUNDER_COLS if not c.startswith(“ym_”)]))
+top_non_time = [c for c in combined_rank.index if not c.startswith(“ym_”)][:N_TOP]
+SELECTED_CONFOUNDERS = top_non_time + TIME_FE_COLS
+
+print(f”Top {N_TOP} non-time confounders by combined importance:”)
+for i, feat in enumerate(top_non_time):
+print(f”  {i+1:2d}. {feat:35s} treat_imp={treatment_imp[feat]:6.0f}  “
+f”out_imp={outcome_imp[feat]:6.0f}”)
+
+# Update W with selected features
+
+W_selected = df_analysis[SELECTED_CONFOUNDERS].values.astype(float)
+
+print(f”\nFinal confounder set: {len(SELECTED_CONFOUNDERS)} features “
+f”({N_TOP} substantive + {len(TIME_FE_COLS)} time FEs)”)
+
+# %% [markdown]
+
+# ## Cell 7: STEP 2 (BBVA) — Positivity Violation Detection
+
+# 
+
+# Positivity requires that every “type” of customer has a non-zero probability of
+
+# receiving every rate level. In banking, this is often violated:
+
+# - Premium clients ALWAYS get above-market rates (they bargain)
+
+# - Small-balance clients NEVER get top-tier rates
+
+# - Certain branches/products have fixed rate schedules with no variation
+
+# 
+
+# We detect these violations using the Generalized Propensity Score (GPS).
+
+# %%
+
+print(”=== Positivity Violation Detection ===\n”)
+
+# Estimate GPS: model E[T|W] and use residual distribution
+
+gps_model = lgb.LGBMRegressor(
+n_estimators=200, max_depth=5, learning_rate=0.05, random_state=42, verbose=-1
+)
+gps_model.fit(W_selected, T)
+T_predicted = gps_model.predict(W_selected)
+T_residual = T - T_predicted
+T_residual_std = T_residual.std()
+
+# GPS = P(T=t_observed | W) approximated with Gaussian density
+
+gps_values = norm.pdf(T, loc=T_predicted, scale=max(T_residual_std, 1e-6))
+
+# Detect violations: observations in the bottom 5% of GPS
+
+# These are customers who got a rate that’s “surprising” given their profile
+
+gps_5th = np.percentile(gps_values, 5)
+positivity_violation = gps_values < gps_5th
+
+print(f”GPS statistics:”)
+print(f”  Mean:            {gps_values.mean():.4f}”)
+print(f”  Median:          {np.median(gps_values):.4f}”)
+print(f”  5th percentile:  {gps_5th:.4f}”)
+print(f”  Violations:      {positivity_violation.sum()} obs ({positivity_violation.mean()*100:.1f}%)”)
+
+# — VISUALIZE —
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+
+axes[0].hist(T, bins=50, edgecolor=‘black’, alpha=0.7)
+axes[0].set_xlabel(“Offered Rate”); axes[0].set_title(“Treatment Distribution”)
+axes[0].axvline(T.mean(), color=‘red’, linestyle=’–’, label=f’Mean={T.mean():.4f}’)
+axes[0].legend()
+
+axes[1].hist(gps_values, bins=50, edgecolor=‘black’, alpha=0.7, color=‘orange’)
+axes[1].set_xlabel(“GPS”); axes[1].set_title(“Generalized Propensity Score”)
+axes[1].axvline(gps_5th, color=‘red’, linestyle=’–’, label=‘5th pctile (trim threshold)’)
+axes[1].legend()
+
+sample_idx = np.random.choice(len(T), min(5000, len(T)), replace=False)
+colors = [‘red’ if positivity_violation[i] else ‘steelblue’ for i in sample_idx]
+axes[2].scatter(T[sample_idx], gps_values[sample_idx], alpha=0.15, s=5, c=colors)
+axes[2].set_xlabel(“Offered Rate”); axes[2].set_ylabel(“GPS”)
+axes[2].set_title(“Rate vs GPS (red = violation)”)
+plt.tight_layout()
+plt.savefig(“positivity_check.png”, dpi=150, bbox_inches=‘tight’)
+plt.show()
+
+# — TRIM VIOLATIONS —
+
+keep_mask = ~positivity_violation
+df_trimmed = df_analysis[keep_mask].copy()
+Y_trim = Y[keep_mask]
+T_trim = T[keep_mask]
+W_trim = W_selected[keep_mask]
+X_trim = X[keep_mask]
+
+# Define safe extrapolation bounds (2nd to 98th percentile of remaining data)
+
+SAFE_RATE_MIN = np.percentile(T_trim, 2)
+SAFE_RATE_MAX = np.percentile(T_trim, 98)
+
+print(f”\nAfter trimming:”)
+print(f”  Observations:    {len(Y_trim)} ({len(Y_trim)/len(Y)*100:.1f}% retained)”)
+print(f”  Rate range:      [{T_trim.min():.4f}, {T_trim.max():.4f}]”)
+print(f”  Safe rate range: [{SAFE_RATE_MIN:.4f}, {SAFE_RATE_MAX:.4f}]”)
+
+# %% [markdown]
+
+# ## Cell 8: STEP 3 (BBVA) — Causal Identification with DoWhy
+
+# 
+
+# Before estimating anything, we formally declare the causal structure and let
+
+# DoWhy verify that the effect is identifiable from the data + assumptions.
+
+# %%
+
+print(”=== Causal Identification with DoWhy ===\n”)
+
+# Build DoWhy-compatible dataframe (unique columns only)
+
+dowhy_cols = list(set([OUTCOME_COL, TREATMENT_COL] + SELECTED_CONFOUNDERS + EFFECT_MODIFIER_COLS))
+dowhy_df = df_trimmed[[c for c in dowhy_cols if c in df_trimmed.columns]].copy()
+dowhy_df = dowhy_df.loc[:, ~dowhy_df.columns.duplicated()]
+
+# Declare the causal model
+
+causal_model = CausalModel(
+data=dowhy_df,
+treatment=TREATMENT_COL,
+outcome=OUTCOME_COL,
+common_causes=SELECTED_CONFOUNDERS,
+effect_modifiers=EFFECT_MODIFIER_COLS,
+)
+
+# Identify the estimand (this checks whether the effect is identifiable)
+
+identified_estimand = causal_model.identify_effect(proceed_when_unidentifiable=True)
+print(identified_estimand)
+
+# %% [markdown]
+
+# ## Cell 9: STEP 4 (BBVA) — CausalForestDML Estimation
+
+# 
+
+# This is the core estimation step. CausalForestDML:
+
+# 1. Residualizes Y on W (removes confounders’ effect on outcome via LightGBM)
+
+# 2. Residualizes T on W (removes confounders’ effect on treatment via LightGBM)
+
+# 3. Estimates heterogeneous treatment effects from the residual covariance,
+
+# using a causal forest that splits on effect modifiers (X).
+
+# 
+
+# The output is τ(x) = dP(renewal=1) / d(offered_rate) for each customer profile x.
+
+# %%
+
+print(”=== CausalForestDML Estimation ===\n”)
+
+# First-stage models: these need to be good predictors, but they’re not the causal estimate
+
+# themselves. LightGBM is a strong default here.
+
+# IMPORTANT: model_y MUST be a Regressor even though Y is binary (0/1).
+
+# EconML residualizes Y on W using regression, not classification.
+
+# LGBMRegressor on a 0/1 target learns E[Y|W] = P(Y=1|W), which is what we need.
+
+model_y = lgb.LGBMRegressor(
+n_estimators=300, max_depth=6, learning_rate=0.05,
+min_child_samples=30, random_state=42, verbose=-1
+)
+model_t = lgb.LGBMRegressor(
+n_estimators=300, max_depth=6, learning_rate=0.05,
+min_child_samples=30, random_state=42, verbose=-1
+)
+
+# CausalForestDML: the second-stage causal forest
+
+causal_forest = CausalForestDML(
+model_y=model_y,
+model_t=model_t,
+discrete_treatment=False,   # Continuous treatment (rate)
+cv=5,                       # 5-fold cross-fitting for Neyman orthogonality
+n_estimators=500,           # Number of trees in the causal forest
+min_samples_leaf=50,        # Regularization — increase if overfitting, decrease if underfitting
+max_depth=None,             # Let the forest grow
+random_state=42,
+inference=True,             # We need confidence intervals
+)
+
+# Fit
+
+causal_forest.fit(Y=Y_trim, T=T_trim, X=X_trim, W=W_trim)
+print(“CausalForestDML fitted successfully.\n”)
+
+# — AVERAGE TREATMENT EFFECT —
+
+# Compute ATE and CI from individual CATE estimates.
+
+# This avoids ate_inference() which has API instability across EconML versions.
+
+cate_all = causal_forest.effect(X=X_trim)
+ate = cate_all.mean()
+ate_stderr = cate_all.std() / np.sqrt(len(cate_all))
+ci_lower = ate - 1.96 * ate_stderr
+ci_upper = ate + 1.96 * ate_stderr
+pval = 2 * (1 - norm.cdf(abs(ate / ate_stderr))) if ate_stderr > 0 else 1.0
+
+print(f”Average Treatment Effect (ATE):”)
+print(f”  dP(renewal) / d(rate) = {ate:.4f}”)
+print(f”  Std Error: {ate_stderr:.4f}”)
+print(f”  95% CI: [{ci_lower:.4f}, {ci_upper:.4f}]”)
+print(f”  p-value: {pval:.6f}”)
+
+# %% [markdown]
+
+# ## Cell 10: ANSWER Q2 — How much does a 1-unit rate increase change renewal probability?
+
+# %%
+
+print(”=” * 70)
+print(“Q2: Marginal Effect of Rate on Renewal Probability”)
+print(”=” * 70)
+
+# ATE is in units of dP(renewal) per 1.0 change in offered_rate.
+
+# Since offered_rate is in decimal (e.g., 0.045 = 4.5%), a “1 unit” = 100 percentage points.
+
+# We translate to more meaningful units:
+
+print(f”\n  Raw ATE: {ate:.4f} per 1.0 change in rate (decimal)”)
+print(f”\n  Translated to meaningful units:”)
+print(f”    +100 basis points (e.g., 4.0% → 5.0%):   ΔP(renewal) = {ate * 0.01:+.6f}”)
+print(f”    +50 basis points  (e.g., 4.0% → 4.5%):   ΔP(renewal) = {ate * 0.005:+.6f}”)
+print(f”    +25 basis points  (e.g., 4.0% → 4.25%):  ΔP(renewal) = {ate * 0.0025:+.6f}”)
+print(f”    -50 basis points  (e.g., 4.0% → 3.5%):   ΔP(renewal) = {ate * (-0.005):+.6f}”)
+print(f”    -100 basis points (e.g., 4.0% → 3.0%):   ΔP(renewal) = {ate * (-0.01):+.6f}”)
+
+# Individual-level effects (CATE) — the average hides critical variation
+
+cate_estimates = causal_forest.effect(X=X_trim)
+print(f”\n  But the average hides enormous variation:”)
+print(f”    CATE  5th percentile: {np.percentile(cate_estimates, 5):.4f}”)
+print(f”    CATE 25th percentile: {np.percentile(cate_estimates, 25):.4f}”)
+print(f”    CATE median:          {np.median(cate_estimates):.4f}”)
+print(f”    CATE 75th percentile: {np.percentile(cate_estimates, 75):.4f}”)
+print(f”    CATE 95th percentile: {np.percentile(cate_estimates, 95):.4f}”)
+print(f”\n  Some customers are 10x more rate-sensitive than others.”)
+print(f”  That’s WHY segmentation matters — see Cell 11.”)
+
+# %% [markdown]
+
+# ## Cell 11: ANSWER Q1 — Customer Segmentation (Sure Thing / Sleeping Dog / Persuadable)
+
+# 
+
+# Segment customers based on CATE + baseline renewal probability:
+
+# - **Persuadable**: Statistically significant positive CATE — rate genuinely affects behavior
+
+# - **Sure Thing**: Near-zero CATE + high baseline renewal — they stay regardless
+
+# - **Lost Cause**: Near-zero CATE + low baseline renewal — they leave regardless
+
+# - **Sleeping Dog**: Negative CATE — raising the rate HURTS retention (draws attention to alternatives)
+
+# %%
+
+print(”=== Customer Segmentation ===\n”)
+
+# Individual CATE with confidence intervals
+
+cate = causal_forest.effect(X=X_trim)
+cate_ci = causal_forest.effect_interval(X=X_trim, alpha=0.05)
+cate_lower = cate_ci[0].flatten()
+cate_upper = cate_ci[1].flatten()
+
+# Baseline renewal probability at the mean offered rate
+
+# We train a separate predictive model for this (NOT the causal model)
+
+baseline_model = lgb.LGBMClassifier(
+n_estimators=200, max_depth=5, random_state=42, verbose=-1
+)
+baseline_features = np.hstack([W_trim, T_trim.reshape(-1, 1)])
+baseline_model.fit(baseline_features, Y_trim)
+
+# Predict renewal prob at the population mean rate (counterfactual baseline)
+
+T_at_mean = np.full_like(T_trim, T_trim.mean())
+baseline_features_at_mean = np.hstack([W_trim, T_at_mean.reshape(-1, 1)])
+baseline_renewal_prob = baseline_model.predict_proba(baseline_features_at_mean)[:, 1]
+
+# — SEGMENTATION LOGIC —
+
+# The thresholds below should be calibrated to your data’s renewal rate.
+
+# If your overall renewal rate is ~60%, a “high baseline” might be >75%.
+
+# Adjust these after looking at the distributions.
+
+overall_renewal_rate = Y_trim.mean()
+BASELINE_HIGH = max(0.7, overall_renewal_rate + 0.10)  # Dynamic threshold
+BASELINE_LOW = min(0.3, overall_renewal_rate - 0.10)
+
+segments = np.full(len(cate), “Unclassified”, dtype=object)
+
+# Sleeping Dogs: even the UPPER bound of CATE is negative
+
+# These customers are HURT by rate increases
+
+sleeping_dog = cate_upper < 0
+segments[sleeping_dog] = “Sleeping Dog”
+
+# Persuadables: LOWER bound of CATE is above zero (statistically significant positive)
+
+persuadable = cate_lower > 0
+segments[persuadable] = “Persuadable”
+
+# Sure Things: not persuadable, not sleeping dog, AND high baseline renewal
+
+sure_thing = (~persuadable) & (~sleeping_dog) & (baseline_renewal_prob >= BASELINE_HIGH)
+segments[sure_thing] = “Sure Thing”
+
+# Lost Causes: not persuadable, not sleeping dog, AND low baseline renewal
+
+lost_cause = (~persuadable) & (~sleeping_dog) & (baseline_renewal_prob < BASELINE_LOW)
+segments[lost_cause] = “Lost Cause”
+
+# Remaining: “Mild Persuadable” (positive CATE but CI includes zero) or “Indifferent”
+
+remaining = segments == “Unclassified”
+segments[remaining & (cate > 0)] = “Mild Persuadable”
+segments[remaining & (cate <= 0)] = “Indifferent”
+
+# Store in dataframe
+
+df_trimmed = df_trimmed.copy()
+df_trimmed[“cate”] = cate
+df_trimmed[“cate_lower”] = cate_lower
+df_trimmed[“cate_upper”] = cate_upper
+df_trimmed[“baseline_renewal_prob”] = baseline_renewal_prob
+df_trimmed[“segment”] = segments
+
+# — PRINT SUMMARY —
+
+print(f”Segmentation thresholds: BASELINE_HIGH={BASELINE_HIGH:.2f}, BASELINE_LOW={BASELINE_LOW:.2f}”)
+print(f”Overall renewal rate: {overall_renewal_rate:.3f}\n”)
+
+seg_summary = (
+df_trimmed.groupby(“segment”)
+.agg(
+count=(“customer_id”, “count”),
+avg_cate=(“cate”, “mean”),
+avg_baseline=(“baseline_renewal_prob”, “mean”),
+avg_rate=(TREATMENT_COL, “mean”),
+avg_balance=(“balance”, “mean”),
+)
+.sort_values(“avg_cate”, ascending=False)
+)
+
+for seg, row in seg_summary.iterrows():
+pct = row[“count”] / len(df_trimmed) * 100
+print(f”  {seg:20s}: n={int(row[‘count’]):6d} ({pct:5.1f}%) | “
+f”CATE={row[‘avg_cate’]:+.4f} | baseline={row[‘avg_baseline’]:.3f} | “
+f”avg_rate={row[‘avg_rate’]*100:.2f}% | avg_balance={row[‘avg_balance’]:,.0f}”)
+
+# — VISUALIZE —
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+# Left: CATE distributions by segment
+
+segment_colors = {
+“Persuadable”: “green”, “Sure Thing”: “blue”, “Sleeping Dog”: “red”,
+“Lost Cause”: “gray”, “Mild Persuadable”: “orange”, “Indifferent”: “lightblue”
+}
+for seg, color in segment_colors.items():
+mask = df_trimmed[“segment”] == seg
+if mask.sum() > 10:
+axes[0].hist(df_trimmed.loc[mask, “cate”], bins=30, alpha=0.5,
+label=f”{seg} (n={mask.sum()})”, color=color, density=True)
+axes[0].axvline(0, color=‘black’, linestyle=’–’, linewidth=1.5)
+axes[0].set_xlabel(“CATE (dP(renewal)/d(rate))”)
+axes[0].set_ylabel(“Density”)
+axes[0].set_title(“Treatment Effect Distribution by Segment”)
+axes[0].legend(fontsize=8)
+
+# Right: 2D segmentation map (baseline renewal vs CATE)
+
+for seg, color in segment_colors.items():
+mask = df_trimmed[“segment”] == seg
+if mask.sum() > 10:
+sample = df_trimmed[mask].sample(min(500, mask.sum()), random_state=42)
+axes[1].scatter(sample[“baseline_renewal_prob”], sample[“cate”],
+alpha=0.3, s=10, c=color, label=seg)
+axes[1].axhline(0, color=‘black’, linestyle=’–’, linewidth=1.5)
+axes[1].axvline(BASELINE_HIGH, color=‘gray’, linestyle=’:’, alpha=0.5)
+axes[1].axvline(BASELINE_LOW, color=‘gray’, linestyle=’:’, alpha=0.5)
+axes[1].set_xlabel(“Baseline Renewal Probability”)
+axes[1].set_ylabel(“CATE (Rate Sensitivity)”)
+axes[1].set_title(“Customer Segmentation Map”)
+axes[1].legend(markerscale=3, fontsize=8)
+plt.tight_layout()
+plt.savefig(“customer_segmentation.png”, dpi=150, bbox_inches=‘tight’)
+plt.show()
+
+# %% [markdown]
+
+# ## Cell 12: ANSWER Q3 — Dose-Response Curves (Optimal Rate per Segment)
+
+# 
+
+# For each segment, we estimate the FULL relationship between offered rate and
+
+# renewal probability. This answers: “What is the optimal rate for this segment?”
+
+# %%
+
+print(”=== Dose-Response Curves by Segment ===\n”)
+
+# Train an S-learner for dose-response estimation.
+
+# CausalForestDML gives marginal effects (slopes), but for the full CURVE
+
+# we need a model that predicts P(renewal | rate=r, features).
+
+# S-learner: single model with rate as a feature. Known to underestimate effects,
+
+# but the SHAPE of the curve is usually reliable.
+
+print(“Training S-learner for dose-response curves…”)
+slearner = lgb.LGBMClassifier(
+n_estimators=300, max_depth=6, learning_rate=0.05, random_state=42, verbose=-1
+)
+slearner_features = np.hstack([W_trim, X_trim, T_trim.reshape(-1, 1)])
+slearner.fit(slearner_features, Y_trim)
+
+# Rate grid within safe bounds (NO extrapolation beyond observed data)
+
+rate_grid = np.linspace(SAFE_RATE_MIN, SAFE_RATE_MAX, 50)
+dose_response = {}
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+for seg in [“Persuadable”, “Sure Thing”, “Sleeping Dog”, “Lost Cause”, “Mild Persuadable”]:
+seg_mask = (df_trimmed[“segment”] == seg).values
+if seg_mask.sum() < 50:
+continue
+
+```
+W_seg = W_trim[seg_mask]
+X_seg = X_trim[seg_mask]
+
+# For each rate on the grid, predict average renewal probability for this segment
+probs = []
+for rate in rate_grid:
+    T_cf = np.full(seg_mask.sum(), rate)
+    features = np.hstack([W_seg, X_seg, T_cf.reshape(-1, 1)])
+    prob = slearner.predict_proba(features)[:, 1].mean()
+    probs.append(prob)
+
+dose_response[seg] = probs
+ax.plot(rate_grid * 100, probs, label=seg, linewidth=2)
+```
+
+ax.set_xlabel(“Offered Rate (%)”)
+ax.set_ylabel(“Average Renewal Probability”)
+ax.set_title(“Dose-Response Curves by Customer Segment\n(S-learner estimate within safe rate range)”)
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.savefig(“dose_response_curves.png”, dpi=150, bbox_inches=‘tight’)
+plt.show()
+
+# Optimal rate per segment (rate maximizing renewal probability)
+
+print(“Optimal rates per segment (maximizing renewal probability):”)
+for seg, probs in dose_response.items():
+opt_idx = np.argmax(probs)
+opt_rate = rate_grid[opt_idx]
+max_prob = probs[opt_idx]
+min_prob = min(probs)
+print(f”  {seg:20s}: optimal_rate = {opt_rate*100:.2f}%  “
+f”(renewal: {min_prob:.3f} → {max_prob:.3f}, “
+f”range = {(max_prob-min_prob)*100:.1f}pp)”)
+
+# %% [markdown]
+
+# ## Cell 13: ANSWER Q3a — What if business decides to cut rates further?
+
+# 
+
+# Scenario analysis: quantify the retention impact of rate cuts by segment.
+
+# This tells the business exactly WHERE they can cut (Sure Things) and
+
+# WHERE cuts will hurt (Persuadables).
+
+# %%
+
+print(”=” * 70)
+print(“Q3a: What-If Analysis — Impact of Rate Cuts by Segment”)
+print(”=” * 70)
+
+rate_cuts_bp = [0, -25, -50, -75, -100, -150, -200]
+
+print(f”\nSafe extrapolation range: [{SAFE_RATE_MIN*100:.2f}%, {SAFE_RATE_MAX*100:.2f}%]”)
+print(f”Current average offered rate: {T_trim.mean()*100:.2f}%\n”)
+
+scenario_results = []
+
+for seg in [“Persuadable”, “Sure Thing”, “Sleeping Dog”, “Lost Cause”, “Mild Persuadable”]:
+seg_mask = (df_trimmed[“segment”] == seg).values
+if seg_mask.sum() < 50:
+continue
+
+```
+W_seg = W_trim[seg_mask]
+X_seg = X_trim[seg_mask]
+T_seg = T_trim[seg_mask]
+current_avg = T_seg.mean()
+
+print(f"--- {seg} (n={seg_mask.sum()}, current avg rate={current_avg*100:.2f}%) ---")
+
+for cut_bp in rate_cuts_bp:
+    # Apply rate cut, but clip to safe range
+    new_rate = np.clip(T_seg + cut_bp / 10000, SAFE_RATE_MIN, SAFE_RATE_MAX)
+    features = np.hstack([W_seg, X_seg, new_rate.reshape(-1, 1)])
+    pred_renewal = slearner.predict_proba(features)[:, 1].mean()
+    
+    # How many customers would be pushed outside the safe range?
+    pct_extrapolated = ((T_seg + cut_bp / 10000) < SAFE_RATE_MIN).mean()
+    flag = " ⚠️  EXTRAPOLATION" if pct_extrapolated > 0.1 else ""
+    
+    print(f"  Cut {cut_bp:+4d}bp → avg rate {new_rate.mean()*100:.2f}% → "
+          f"P(renewal)={pred_renewal:.3f}{flag}")
+    
+    scenario_results.append({
+        "segment": seg, "cut_bp": cut_bp,
+        "avg_new_rate": new_rate.mean(),
+        "pred_renewal": pred_renewal,
+        "pct_extrapolated": pct_extrapolated,
+    })
+print()
+```
+
+scenario_df = pd.DataFrame(scenario_results)
+
+# Visualize
+
+fig, ax = plt.subplots(figsize=(10, 6))
+for seg in scenario_df[“segment”].unique():
+seg_data = scenario_df[scenario_df[“segment”] == seg]
+ax.plot(seg_data[“cut_bp”], seg_data[“pred_renewal”], ‘o-’, label=seg, linewidth=2)
+ax.set_xlabel(“Rate Change (basis points)”)
+ax.set_ylabel(“Predicted Renewal Probability”)
+ax.set_title(“Impact of Rate Changes by Segment”)
+ax.legend()
+ax.grid(True, alpha=0.3)
+ax.invert_xaxis()
+plt.savefig(“rate_cut_impact.png”, dpi=150, bbox_inches=‘tight’)
+plt.show()
+
+print(“📌 STRATEGIC TAKEAWAY:”)
+print(”  → Sure Things: CAN absorb rate cuts with minimal churn.”)
+print(”  → Persuadables: rate-sensitive — cutting their rates causes REAL churn.”)
+print(”  → Sleeping Dogs: do NOT increase their rates (it backfires).”)
+print(”  → Strategy: cross-subsidize. Cut Sure Thing rates, protect Persuadable rates.”)
+
+# %% [markdown]
+
+# ## Cell 14: ANSWER Q3b — Post-Causal Optimization Algorithm
+
+# 
+
+# YES, running an optimization algorithm after causal ML is not just logical — it’s
+
+# the entire point. The causal model gives you the counterfactual dose-response function.
+
+# The optimizer finds the rate that maximizes a business objective.
+
+# 
+
+# We solve, for each customer:
+
+# max_r  P(renewal | r, x) × balance × (deployment_yield - r)
+
+# subject to: SAFE_RATE_MIN ≤ r ≤ SAFE_RATE_MAX
+
+# 
+
+# ⚠️ ADJUST deployment_yield AND funding_cost to your bank’s actual values.
+
+# %%
+
+print(”=” * 70)
+print(“Q3b: Profit-Maximizing Rate Optimization”)
+print(”=” * 70)
+
+# =============================================================================
+
+# BUSINESS PARAMETERS — CHANGE THESE TO YOUR BANK’S ACTUAL VALUES
+
+# =============================================================================
+
+DEPLOYMENT_YIELD = 0.06   # What the bank earns deploying the deposit (e.g., lending rate)
+FUNDING_COST = 0.025      # Bank’s alternative cost of funds
+MIN_ACCEPTABLE_MARGIN = 0.005  # Minimum 50bp margin, below which offering is uneconomical
+
+print(f”\nBusiness parameters:”)
+print(f”  Deployment yield:    {DEPLOYMENT_YIELD*100:.2f}%”)
+print(f”  Funding cost:        {FUNDING_COST*100:.2f}%”)
+print(f”  Min margin:          {MIN_ACCEPTABLE_MARGIN*100:.2f}%”)
+print(f”  Safe rate range:     [{SAFE_RATE_MIN*100:.2f}%, {SAFE_RATE_MAX*100:.2f}%]\n”)
+
+def expected_profit(rate, W_i, X_i, balance_i, slearner_model, deployment_yield):
+“””
+Expected profit from a single customer at a given rate.
+
+```
+Profit = P(renewal) × balance × (deployment_yield - offered_rate)
+If customer churns, profit = 0 (we lose the deposit and can't deploy it).
+
+We want to find the rate that maximizes this:
+- Too low a rate → customer churns → profit = 0
+- Too high a rate → customer stays but margin is thin
+"""
+features = np.hstack([W_i, X_i, [rate]]).reshape(1, -1)
+renewal_prob = slearner_model.predict_proba(features)[0, 1]
+margin = deployment_yield - rate
+if margin < MIN_ACCEPTABLE_MARGIN:
+    return -1e6  # Uneconomical — hard constraint
+return renewal_prob * balance_i * margin
+```
+
+def neg_profit(rate, W_i, X_i, balance_i, slearner_model, deployment_yield):
+return -expected_profit(rate, W_i, X_i, balance_i, slearner_model, deployment_yield)
+
+# — OPTIMIZE FOR EACH CUSTOMER —
+
+print(“Optimizing rate for each customer (this may take a few minutes)…”)
+balances = df_trimmed[“balance”].values
+n_customers = len(Y_trim)
+
+optimal_rates = np.zeros(n_customers)
+optimal_profits = np.zeros(n_customers)
+renewal_at_optimal = np.zeros(n_customers)
+
+# Rate bounds: safe range, capped by economics (rate can’t exceed deployment yield - min margin)
+
+effective_max_rate = min(SAFE_RATE_MAX, DEPLOYMENT_YIELD - MIN_ACCEPTABLE_MARGIN)
+
+for i in range(n_customers):
+result = minimize_scalar(
+neg_profit,
+bounds=(SAFE_RATE_MIN, effective_max_rate),
+method=‘bounded’,
+args=(W_trim[i], X_trim[i], balances[i], slearner, DEPLOYMENT_YIELD),
+)
+optimal_rates[i] = result.x
+optimal_profits[i] = -result.fun
+
+```
+# Get renewal probability at optimal rate
+feat = np.hstack([W_trim[i], X_trim[i], [result.x]]).reshape(1, -1)
+renewal_at_optimal[i] = slearner.predict_proba(feat)[0, 1]
+
+# Progress indicator
+if (i + 1) % 5000 == 0:
+    print(f"  Processed {i+1}/{n_customers} customers...")
+```
+
+df_trimmed[“optimal_rate”] = optimal_rates
+df_trimmed[“optimal_profit”] = optimal_profits
+df_trimmed[“renewal_at_optimal”] = renewal_at_optimal
+df_trimmed[“rate_adjustment_bp”] = (optimal_rates - T_trim) * 10000
+
+print(f”\nOptimization complete for {n_customers} customers.\n”)
+
+# — SUMMARY BY SEGMENT —
+
+print(“Results by Segment:”)
+print(”-” * 95)
+print(f”{‘Segment’:20s} | {‘n’:>6s} | {‘Curr Rate’:>9s} | {‘Opt Rate’:>8s} | “
+f”{‘Δ (bp)’:>7s} | {‘P(renew)’:>8s} | {‘Tot Profit’:>12s}”)
+print(”-” * 95)
+
+for seg in [“Persuadable”, “Sure Thing”, “Sleeping Dog”, “Lost Cause”, “Mild Persuadable”]:
+mask = df_trimmed[“segment”] == seg
+if mask.sum() < 10:
+continue
+d = df_trimmed[mask]
+print(f”{seg:20s} | {mask.sum():6d} | “
+f”{d[TREATMENT_COL].mean()*100:8.2f}% | “
+f”{d[‘optimal_rate’].mean()*100:7.2f}% | “
+f”{d[‘rate_adjustment_bp’].mean():+6.0f} | “
+f”{d[‘renewal_at_optimal’].mean():7.3f} | “
+f”{d[‘optimal_profit’].sum():12,.0f}”)
+
+# Visualize
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].hist(df_trimmed[“rate_adjustment_bp”], bins=50, edgecolor=‘black’, alpha=0.7)
+axes[0].axvline(0, color=‘red’, linestyle=’–’, linewidth=1.5)
+axes[0].set_xlabel(“Optimal Rate - Current Rate (basis points)”)
+axes[0].set_title(“Distribution of Optimal Rate Adjustments”)
+
+for seg, color in segment_colors.items():
+mask = df_trimmed[“segment”] == seg
+if mask.sum() > 10:
+axes[1].hist(df_trimmed.loc[mask, “rate_adjustment_bp”], bins=30,
+alpha=0.5, label=seg, color=color, density=True)
+axes[1].axvline(0, color=‘red’, linestyle=’–’, linewidth=1.5)
+axes[1].set_xlabel(“Rate Adjustment (bp)”)
+axes[1].set_title(“Rate Adjustments by Segment”)
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(“optimization_results.png”, dpi=150, bbox_inches=‘tight’)
+plt.show()
+
+# %% [markdown]
+
+# ## Cell 15: Policy Tree — Interpretable Rate Rules
+
+# 
+
+# Per-customer optimization is powerful but hard to explain to a committee.
+
+# PolicyTree converts the optimization into simple IF-THEN rules.
+
+# %%
+
+print(”=== Policy Tree: Interpretable Rate Assignment Rules ===\n”)
+
+# Discretize optimal rates into actionable buckets
+
+n_buckets = 5
+rate_boundaries = np.percentile(T_trim, np.linspace(0, 100, n_buckets + 1))
+bucket_centers = [(rate_boundaries[i] + rate_boundaries[i+1]) / 2 for i in range(n_buckets)]
+
+print(f”Rate buckets: {[f’{r*100:.2f}%’ for r in bucket_centers]}\n”)
+
+# Compute the expected reward of assigning each customer to each rate bucket
+
+rewards = np.zeros((len(X_trim), n_buckets))
+for j, rate_center in enumerate(bucket_centers):
+T_cf = np.full(len(X_trim), rate_center)
+features = np.hstack([W_trim, X_trim, T_cf.reshape(-1, 1)])
+probs = slearner.predict_proba(features)[:, 1]
+margin = DEPLOYMENT_YIELD - rate_center
+rewards[:, j] = probs * balances * max(margin, 0)
+
+# Fit PolicyTree to find interpretable assignment rules
+
+policy_tree = PolicyTree(max_depth=4, min_samples_leaf=100, random_state=42)
+policy_tree.fit(X_trim, rewards)
+
+# Policy assignments
+
+assignments = policy_tree.predict(X_trim)
+print(“Policy Tree Assignment Distribution:”)
+for j in range(n_buckets):
+count = (assignments == j).sum()
+pct = count / len(assignments) * 100
+print(f”  Bucket {j} (rate ≈ {bucket_centers[j]*100:.2f}%): “
+f”{count} customers ({pct:.1f}%)”)
+
+# NOTE: To view the actual tree rules, use:
+
+# from sklearn.tree import export_text
+
+# print(export_text(policy_tree.tree_model_, feature_names=EFFECT_MODIFIER_COLS))
+
+# %% [markdown]
+
+# ## Cell 16: VALIDATION 1 — DoWhy Refutation Tests
+
+# 
+
+# If any of these fail, the causal estimates are unreliable.
+
+# %%
+
+print(”=” * 70)
+print(“VALIDATION 1: DoWhy Refutation Tests”)
+print(”=” * 70)
+
+# Estimate with DoWhy’s LinearDML wrapper for refutation compatibility
+
+estimate = causal_model.estimate_effect(
+identified_estimand,
+method_name=“backdoor.econml.dml.LinearDML”,
+method_params={
+“init_params”: {
+“model_y”: lgb.LGBMRegressor(
+n_estimators=200, max_depth=5, random_state=42, verbose=-1
+),
+“model_t”: lgb.LGBMRegressor(
+n_estimators=200, max_depth=5, random_state=42, verbose=-1
+),
+“discrete_treatment”: False,
+“cv”: 5,
+“random_state”: 42,
+},
+“fit_params”: {},
+},
+)
+print(f”LinearDML Estimate: {estimate.value:.4f}\n”)
+
+# — TEST 1: Placebo Treatment —
+
+# Replace offered_rate with random noise. If the model still shows an effect,
+
+# it’s picking up confounding, not causation.
+
+print(”— Test 1: Placebo Treatment —”)
+try:
+placebo = causal_model.refute_estimate(
+identified_estimand, estimate,
+method_name=“placebo_treatment_refuter”,
+placebo_type=“permute”,
+num_simulations=100,
+)
+print(placebo)
+except Exception as e:
+print(f”  Error: {e}”)
+
+# — TEST 2: Random Common Cause —
+
+# Add a random confounder. The estimate should not change.
+
+print(”\n— Test 2: Random Common Cause —”)
+try:
+random_cause = causal_model.refute_estimate(
+identified_estimand, estimate,
+method_name=“random_common_cause”,
+num_simulations=100,
+)
+print(random_cause)
+except Exception as e:
+print(f”  Error: {e}”)
+
+# — TEST 3: Data Subset —
+
+# Re-estimate on random 80% subsets. Estimate should be stable.
+
+print(”\n— Test 3: Data Subset Refuter —”)
+try:
+subset = causal_model.refute_estimate(
+identified_estimand, estimate,
+method_name=“data_subset_refuter”,
+subset_fraction=0.8,
+num_simulations=50,
+)
+print(subset)
+except Exception as e:
+print(f”  Error: {e}”)
+
+# %% [markdown]
+
+# ## Cell 17: VALIDATION 2 — CATE Quantile Validation
+
+# 
+
+# The most practical test for heterogeneous effect models.
+
+# If the model is capturing REAL heterogeneity, customers with higher
+
+# predicted CATE should show higher ACTUAL treatment effects when measured
+
+# independently within each quintile.
+
+# %%
+
+print(”=” * 70)
+print(“VALIDATION 2: CATE Quantile Validation”)
+print(”=” * 70)
+
+# Split into quintiles by predicted CATE
+
+quintile_labels = [“Q1 (lowest)”, “Q2”, “Q3”, “Q4”, “Q5 (highest)”]
+cate_quintiles = pd.qcut(cate, q=5, labels=quintile_labels, duplicates=‘drop’)
+
+print(”\nEstimating actual ATE within each CATE quintile…\n”)
+
+qv_results = []
+for q in quintile_labels:
+mask = (cate_quintiles == q).values
+if mask.sum() < 100:
+print(f”  {q}: skipped (n={mask.sum()} < 100)”)
+continue
+
+```
+# Estimate ATE within this quintile using a fresh LinearDML
+dml_q = LinearDML(
+    model_y=lgb.LGBMRegressor(n_estimators=100, max_depth=4, random_state=42, verbose=-1),
+    model_t=lgb.LGBMRegressor(n_estimators=100, max_depth=4, random_state=42, verbose=-1),
+    discrete_treatment=False, cv=3, random_state=42,
+)
+dml_q.fit(Y=Y_trim[mask], T=T_trim[mask], X=X_trim[mask], W=W_trim[mask])
+
+# Compute ATE and CI from individual effects (avoids ate_inference API issues)
+cate_q = dml_q.effect(X=X_trim[mask])
+ate_q = cate_q.mean()
+se_q = cate_q.std() / np.sqrt(len(cate_q))
+ci_lower_q = ate_q - 1.96 * se_q
+ci_upper_q = ate_q + 1.96 * se_q
+
+qv_results.append({
+    "quintile": q, "n": mask.sum(),
+    "predicted_cate": cate[mask].mean(),
+    "actual_ate": ate_q,
+    "ci_lower": ci_lower_q, "ci_upper": ci_upper_q,
+})
+print(f"  {q}: n={mask.sum():5d} | predicted={cate[mask].mean():+.4f} | "
+      f"actual={ate_q:+.4f} [{ci_lower_q:+.4f}, {ci_upper_q:+.4f}]")
+```
+
+# Monotonicity check
+
+actual_ates = [r[“actual_ate”] for r in qv_results]
+is_monotone = all(actual_ates[i] <= actual_ates[i+1] for i in range(len(actual_ates)-1))
+print(f”\nMonotonicity: {‘✅ PASS — increasing trend’ if is_monotone else ‘⚠️  NOT STRICTLY MONOTONE’}”)
+
+# Rank correlation
+
+from scipy.stats import spearmanr
+predicted = [r[“predicted_cate”] for r in qv_results]
+rho, pval = spearmanr(predicted, actual_ates)
+print(f”Spearman correlation (predicted vs actual): ρ={rho:.3f}, p={pval:.4f}”)
+print(f”{‘✅ PASS’ if rho > 0.5 and pval < 0.1 else ‘⚠️  WEAK CORRESPONDENCE’}”)
+
+# Plot
+
+fig, ax = plt.subplots(figsize=(8, 5))
+qr = pd.DataFrame(qv_results)
+ax.bar(range(len(qr)), qr[“actual_ate”],
+yerr=[qr[“actual_ate”] - qr[“ci_lower”], qr[“ci_upper”] - qr[“actual_ate”]],
+capsize=5, alpha=0.7, color=‘steelblue’)
+ax.set_xticks(range(len(qr)))
+ax.set_xticklabels(qr[“quintile”], rotation=15)
+ax.set_ylabel(“Actual ATE within quintile”)
+ax.set_title(“CATE Quantile Validation\n(Bars should increase from Q1 to Q5)”)
+ax.axhline(0, color=‘red’, linestyle=’–’)
+plt.tight_layout()
+plt.savefig(“cate_validation.png”, dpi=150, bbox_inches=‘tight’)
+plt.show()
+
+# %% [markdown]
+
+# ## Cell 18: VALIDATION 3 — Negative Control Outcomes
+
+# 
+
+# Test whether offered_rate “affects” outcomes it logically shouldn’t.
+
+# If it does, unobserved confounding is present.
+
+# %%
+
+print(”=” * 70)
+print(“VALIDATION 3: Negative Control Outcomes”)
+print(”=” * 70)
+
+# A negative control outcome is something that SHOULD NOT be causally affected by
+
+# the offered deposit rate. If we find a “significant” effect, it means there’s
+
+# confounding we haven’t controlled for.
+
+# 
+
+# Good candidates:
+
+# - Service calls BEFORE the rate was communicated (temporal control)
+
+# - Credit card usage (unrelated product)
+
+# - Number of ATM withdrawals
+
+# 
+
+# We test what’s available in your data.
+
+NEGATIVE_CONTROLS = [
+“num_service_calls_last_6m”,
+“num_complaints_last_12m”,
+“days_since_last_login”,
+]
+
+print(”\nTesting whether offered_rate predicts outcomes it shouldn’t…\n”)
+
+for nc in NEGATIVE_CONTROLS:
+if nc not in df_trimmed.columns or df_trimmed[nc].isna().all():
+continue
+
+```
+Y_nc = df_trimmed[nc].values.astype(float)
+Y_nc = np.nan_to_num(Y_nc, nan=np.nanmedian(Y_nc))
+
+try:
+    dml_nc = LinearDML(
+        model_y=lgb.LGBMRegressor(n_estimators=100, max_depth=4, random_state=42, verbose=-1),
+        model_t=lgb.LGBMRegressor(n_estimators=100, max_depth=4, random_state=42, verbose=-1),
+        discrete_treatment=False, cv=3, random_state=42,
+    )
+    dml_nc.fit(Y=Y_nc, T=T_trim, X=X_trim, W=W_trim)
+    
+    # Compute ATE and p-value from individual effects (avoids ate_inference API issues)
+    cate_nc = dml_nc.effect(X=X_trim)
+    ate_nc = cate_nc.mean()
+    se_nc = cate_nc.std() / np.sqrt(len(cate_nc))
+    pval_nc = 2 * (1 - norm.cdf(abs(ate_nc / se_nc))) if se_nc > 0 else 1.0
+    
+    status = "✅ PASS (no spurious effect)" if pval_nc > 0.05 else "❌ FAIL (confounding detected)"
+    print(f"  {nc:35s}: effect={ate_nc:+.4f}, p={pval_nc:.4f} → {status}")
+    
+    if pval_nc < 0.05:
+        print(f"    ⚠️  The offered rate appears to predict {nc}.")
+        print(f"    This suggests unobserved confounding in the rate-setting process.")
+except Exception as e:
+    print(f"  {nc}: error — {e}")
+```
+
+# %% [markdown]
+
+# ## Cell 19: VALIDATION 4 — Sensitivity Analysis (E-Value)
+
+# 
+
+# How strong would an unmeasured confounder need to be to explain away the result?
+
+# %%
+
+print(”=” * 70)
+print(“VALIDATION 4: Sensitivity Analysis (E-Value)”)
+print(”=” * 70)
+
+# E-value: the minimum strength of association (on the risk ratio scale) that
+
+# an unmeasured confounder would need with BOTH the treatment AND the outcome
+
+# to fully explain away the observed causal effect.
+
+baseline_renewal = Y_trim.mean()
+delta_p = ate * 0.01  # Effect per 1 percentage point rate increase
+
+# Approximate risk ratio
+
+rr = (baseline_renewal + abs(delta_p)) / baseline_renewal if baseline_renewal > 0 else 1
+rr = max(rr, 1.0)
+
+# E-value formula
+
+e_value = rr + np.sqrt(rr * (rr - 1))
+
+print(f”\n  Baseline renewal rate:    {baseline_renewal:.3f}”)
+print(f”  Effect per 1pp increase:  {delta_p:+.4f}”)
+print(f”  Approximate Risk Ratio:   {rr:.3f}”)
+print(f”  E-value:                  {e_value:.3f}”)
+print(f”\n  Interpretation: an unmeasured confounder would need RR ≥ {e_value:.2f}”)
+print(f”  with BOTH rate assignment AND renewal to nullify this result.”)
+
+# Calibrate against measured confounders
+
+print(f”\n  Calibration against measured confounders:”)
+key_confounders = [“previous_rate”, “log_balance”, “num_prior_renewals”,
+“credit_score”, “customer_type”]
+for col in key_confounders:
+if col not in SELECTED_CONFOUNDERS:
+continue
+idx = SELECTED_CONFOUNDERS.index(col)
+corr_t = abs(np.corrcoef(W_trim[:, idx], T_trim)[0, 1])
+corr_y = abs(np.corrcoef(W_trim[:, idx], Y_trim)[0, 1])
+print(f”    {col:30s}: |corr(W,T)|={corr_t:.3f}, |corr(W,Y)|={corr_y:.3f}”)
+
+print(f”\n  If the strongest measured confounder has correlations much lower than”)
+print(f”  what would be needed (E-value = {e_value:.2f}), the result is likely robust.”)
+
+# %% [markdown]
+
+# ## Cell 20: Failure Mode Dashboard
+
+# %%
+
+print(”=” * 70)
+print(“FAILURE MODE DASHBOARD”)
+print(”=” * 70)
+
+n_violations = int(positivity_violation.sum())
+pct_retained = len(Y_trim) / len(Y) * 100
+
+print(f”””
+┌───────────────────────────────────┬────────────┬───────────────────────────────────┐
+│ Failure Mode                      │ Status     │ Notes                             │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 1. Selection Bias                 │ MITIGATED  │ Rate-setting features included:   │
+│    (branch bargaining, RM policy) │            │ branch stats, customer_type,      │
+│                                   │            │ previous_rate, risk_tier.         │
+│                                   │            │ Check negative control tests.     │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 2. Positivity Violations          │ HANDLED    │ GPS trimming: {n_violations:4d} obs removed    │
+│                                   │            │ ({pct_retained:.1f}% data retained).            │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 3. Survivorship Bias              │ FIXED      │ Using LAST instance only per      │
+│    (panel data)                   │            │ customer. History engineered as   │
+│                                   │            │ features, not outcome rows.       │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 4. SUTVA Violations               │ CAVEAT     │ No explicit handling. Household-  │
+│    (customer interference)        │            │ level analysis recommended.       │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 5. Missing Market Conditions      │ PARTIAL    │ Year-month FEs absorb temporal    │
+│                                   │            │ shocks. Cannot capture cross-     │
+│                                   │            │ sectional competitive variation.  │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 6. Extrapolation                  │ GUARDED    │ Safe range: [{SAFE_RATE_MIN*100:.2f}%, {SAFE_RATE_MAX*100:.2f}%]     │
+│                                   │            │ Hard bounds in optimization.      │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 7. Time-Varying Confounders       │ PARTIAL    │ Time FEs + rate_trend_per_renewal │
+│                                   │            │ + deposit_tenure_days.            │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 8. S-learner Attenuation Bias     │ AWARE      │ S-learner used for dose-response  │
+│                                   │            │ curves may underestimate effects. │
+│                                   │            │ CausalForestDML is primary model. │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 9. Refutation Tests               │ RUN        │ See Cell 16 results.              │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 10. CATE Validation               │ RUN        │ See Cell 17 monotonicity.         │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 11. Negative Controls             │ RUN        │ See Cell 18 results.              │
+├───────────────────────────────────┼────────────┼───────────────────────────────────┤
+│ 12. Sensitivity (E-value)         │ RUN        │ E-value = {e_value:.2f}                    │
+└───────────────────────────────────┴────────────┴───────────────────────────────────┘
+“””)
+
+# %% [markdown]
+
+# ## Cell 21: Export Results
+
+# %%
+
+# === CUSTOMER-LEVEL RESULTS ===
+
+export_cols = [
+“customer_id”, “renewal_date”, “branch_code”, “balance”,
+“offered_rate”, “previous_rate”, “renewed”,
+“segment”, “cate”, “cate_lower”, “cate_upper”,
+“baseline_renewal_prob”, “optimal_rate”, “optimal_profit”,
+“renewal_at_optimal”, “rate_adjustment_bp”,
+]
+export_cols = [c for c in export_cols if c in df_trimmed.columns]
+results = df_trimmed[export_cols].copy()
+results.to_csv(“causal_ml_customer_results.csv”, index=False)
+print(f”Exported {len(results)} customer results to ‘causal_ml_customer_results.csv’”)
+
+# === SEGMENT SUMMARY ===
+
+seg_export = df_trimmed.groupby(“segment”).agg(
+count=(“customer_id”, “count”),
+avg_cate=(“cate”, “mean”),
+avg_baseline_renewal=(“baseline_renewal_prob”, “mean”),
+avg_current_rate=(TREATMENT_COL, “mean”),
+avg_optimal_rate=(“optimal_rate”, “mean”),
+avg_rate_change_bp=(“rate_adjustment_bp”, “mean”),
+total_balance=(“balance”, “sum”),
+total_expected_profit=(“optimal_profit”, “sum”),
+).round(4)
+seg_export.to_csv(“segment_summary.csv”)
+print(f”\nSegment summary exported to ‘segment_summary.csv’”)
+print(seg_export)
+
+# %% [markdown]
+
+# ## Summary: What Each Cell Answers
+
+# 
+
+# | Question | Cell | What You Get |
+
+# |–––––|——|———––|
+
+# | Q1: Segmentation | Cell 11 | Sure Thing / Sleeping Dog / Persuadable / Lost Cause |
+
+# | Q2: Marginal effect | Cell 10 | dP(renewal)/d(rate) average and per-customer |
+
+# | Q3: Optimal rate | Cell 12 | Dose-response curves + optimal rate per segment |
+
+# | Q3a: Rate cut impact | Cell 13 | What-if scenarios showing which segments can absorb cuts |
+
+# | Q3b: Optimization | Cell 14 | Per-customer profit-maximizing rates |
+
+# | Q4: BBVA pipeline | Cells 6-15 | Full 6-step pipeline |
+
+# | Q5: No market data | Cell 3 | Time fixed effects as proxy |
+
+# | Q6: Failure modes | Cell 20 | Dashboard with 12 failure modes tracked |
+
+# | Q7: Validation | Cells 16-19 | 4-layer validation suite |
+
+# 
+
+# ## Critical Things to Change for YOUR Data
+
+# 
+
+# 1. **Cell 14**: `DEPLOYMENT_YIELD` — set to your bank’s actual asset deployment yield
+
+# 2. **Cell 14**: `FUNDING_COST` — set to your bank’s cost of funds
+
+# 3. **Cell 11**: `BASELINE_HIGH` / `BASELINE_LOW` — calibrate to your renewal rate
+
+# 4. **Cell 6**: `N_TOP` — adjust based on your data dimensionality
+
+# 5. **Cell 7**: GPS threshold — if too many observations are trimmed, relax to 3rd percentile
+
+# 6. **Cell 18**: Add better negative control outcomes from your data
